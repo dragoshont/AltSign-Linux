@@ -4,18 +4,10 @@
 
 #include "AnisetteData.h"
 
-// Core Crypto
-extern "C" {
-#include <corecrypto/ccsrp.h>
-#include <corecrypto/ccdrbg.h>
-#include <corecrypto/ccsrp_gp.h>
-#include <corecrypto/ccdigest.h>
-#include <corecrypto/ccsha2.h>
-#include <corecrypto/ccpbkdf2.h>
-#include <corecrypto/cchmac.h>
-#include <corecrypto/ccaes.h>
-#include <corecrypto/ccpad.h>
-}
+// libgsa — corecrypto-free GrandSlam crypto (OpenSSL-backed).
+// Replaces the entire <corecrypto/*> dependency; see github.com/dragoshont/libgsa.
+#include <gsa/srp.h>
+#include <gsa/crypto.h>
 
 #include <ostream>
 
@@ -32,12 +24,6 @@ extern bool decompress(const uint8_t* input, size_t input_size, std::vector<uint
 
 #include "altsign_common.h"
 
-//struct ccrng_state* ccDRBGGetRngState(void);
-
-static const char ALTHexCharacters[] = "0123456789abcdef";
-
-struct ccrng_state* RNG = NULL;
-
 std::vector<unsigned char> DataFromBytes(const char* bytes, size_t count)
 {
 	std::vector<unsigned char> data;
@@ -50,166 +36,126 @@ std::vector<unsigned char> DataFromBytes(const char* bytes, size_t count)
 	return data;
 }
 
-void ALTDigestUpdateString(const struct ccdigest_info* di_info, struct ccdigest_ctx* di_ctx, std::string string)
+/*
+ * The "negotiation proof" running digest. corecrypto streamed this via
+ * ccdigest_update into a ccdigest_ctx; libgsa exposes a one-shot SHA-256, so we
+ * accumulate the same byte sequence in a buffer and hash it once at the end.
+ * The first (di_info) argument is unused, kept only so the many call sites stay
+ * byte-identical to the corecrypto version.
+ */
+void ALTDigestUpdateString(const void* /*unused*/, std::vector<unsigned char>* negProof, std::string string)
 {
-	ccdigest_update(di_info, di_ctx, string.length(), string.c_str());
+	negProof->insert(negProof->end(), string.begin(), string.end());
 }
 
-void ALTDigestUpdateData(const struct ccdigest_info* di_info, struct ccdigest_ctx* di_ctx, std::vector<unsigned char>& data)
+void ALTDigestUpdateData(const void* /*unused*/, std::vector<unsigned char>* negProof, std::vector<unsigned char>& data)
 {
-	uint32_t data_len = (uint32_t)data.size(); // 4 bytes for length
-	ccdigest_update(di_info, di_ctx, sizeof(data_len), &data_len);
-	ccdigest_update(di_info, di_ctx, data_len, data.data());
+	uint32_t data_len = (uint32_t)data.size(); // 4 bytes for length, native byte order (matches ccdigest_update)
+	const unsigned char* lenp = (const unsigned char*)&data_len;
+	negProof->insert(negProof->end(), lenp, lenp + sizeof(data_len));
+	negProof->insert(negProof->end(), data.begin(), data.end());
 }
 
-std::optional<std::vector<unsigned char>> ALTPBKDF2SRP(const struct ccdigest_info* di_info, bool isS2k, std::string password, std::vector<unsigned char>& salt, int iterations)
+std::optional<std::vector<unsigned char>> ALTPBKDF2SRP(const void* /*unused*/, bool isS2k, std::string password, std::vector<unsigned char>& salt, int iterations)
 {
-	const struct ccdigest_info* password_di_info = ccsha256_di();
-	char* digest_raw = (char*)malloc(password_di_info->output_size);
-	const char* passwordUTF8 = password.c_str();
-	ccdigest(password_di_info, strlen(passwordUTF8), passwordUTF8, digest_raw);
-
-	size_t final_digest_len = password_di_info->output_size * (isS2k ? 1 : 2);
-	char* digest = (char*)malloc(final_digest_len);
-
-	if (isS2k)
-	{
-		memcpy(digest, digest_raw, final_digest_len);
-	}
-	else
-	{
-		for (size_t i = 0; i < password_di_info->output_size; i++)
-		{
-			char byte = digest_raw[i];
-			digest[i * 2 + 0] = ALTHexCharacters[(byte >> 4) & 0x0F];
-			digest[i * 2 + 1] = ALTHexCharacters[(byte >> 0) & 0x0F];
-		}
-	}
-
-	char *outputBytes = (char*)malloc(di_info->output_size);
-
-	if (ccpbkdf2_hmac(di_info, final_digest_len, digest, salt.size(), salt.data(), iterations, di_info->output_size, outputBytes) != 0)
+	// s2k:    key = PBKDF2(SHA256(password),        salt, iters, 32)
+	// s2k_fo: key = PBKDF2(hex(SHA256(password)),   salt, iters, 32)
+	uint8_t outputBytes[GSA_SHA256_LEN];
+	if (gsa_srp_s2k(password.c_str(), salt.data(), salt.size(), (uint32_t)iterations, isS2k ? 0 : 1, outputBytes) != 0)
 	{
 		return std::nullopt;
 	}
-
-	auto data = DataFromBytes(outputBytes, di_info->output_size);
+	auto data = DataFromBytes((const char*)outputBytes, sizeof(outputBytes));
 	return std::make_optional(data);
 }
 
-std::vector<unsigned char> ALTCreateSessionKey(ccsrp_ctx_t srp_ctx, const char* key_name)
+std::vector<unsigned char> ALTCreateSessionKey(gsa_srp_ctx* srp_ctx, const char* key_name)
 {
-	size_t key_len;
-	const void* session_key = ccsrp_get_session_key(srp_ctx, &key_len);
+	uint8_t session_key[GSA_SHA256_LEN];
+	size_t key_len = sizeof(session_key);
+	if (gsa_srp_session_key(srp_ctx, session_key, &key_len) != 0)
+	{
+		return std::vector<unsigned char>();
+	}
 
-	const struct ccdigest_info* di_info = ccsha256_di();
+	uint8_t hmac_bytes[GSA_SHA256_LEN];
+	gsa_hmac_sha256(session_key, key_len, (const uint8_t*)key_name, strlen(key_name), hmac_bytes);
 
-	size_t length = strlen(key_name);
-
-	size_t hmac_len = di_info->output_size;
-	unsigned char* hmac_bytes = (unsigned char*)malloc(hmac_len);
-	cchmac(di_info, key_len, session_key, length, key_name, hmac_bytes);
-
-	auto data = DataFromBytes((const char *)hmac_bytes, hmac_len);
-	return data;
+	return DataFromBytes((const char*)hmac_bytes, sizeof(hmac_bytes));
 }
 
-std::optional<std::vector<unsigned char>> ALTDecryptDataCBC(ccsrp_ctx_t srp_ctx, std::vector<unsigned char>& spd)
+std::optional<std::vector<unsigned char>> ALTDecryptDataCBC(gsa_srp_ctx* srp_ctx, std::vector<unsigned char>& spd)
 {
 	auto extraDataKey = ALTCreateSessionKey(srp_ctx, "extra data key:");
 	auto extraDataIV = ALTCreateSessionKey(srp_ctx, "extra data iv:");
-
-	char* decryptedBytes = (char*)malloc(spd.size());
-
-	const struct ccmode_cbc* decrypt_mode = ccaes_cbc_decrypt_mode();
-
-	cccbc_iv* iv = (cccbc_iv*)malloc(decrypt_mode->block_size);
-	if (extraDataIV.data())
-	{
-		memcpy(iv, extraDataIV.data(), decrypt_mode->block_size);
-	}
-	else
-	{
-		memset(iv, 0, decrypt_mode->block_size);
-	}
-
-	cccbc_ctx* ctx_buf = (cccbc_ctx*)malloc(decrypt_mode->size);
-	decrypt_mode->init(decrypt_mode, ctx_buf, extraDataKey.size(), extraDataKey.data());
-
-	size_t length = ccpad_pkcs7_decrypt(decrypt_mode, ctx_buf, iv, spd.size(), spd.data(), decryptedBytes);
-	if (length > spd.size())
+	if (extraDataKey.size() < 32 || extraDataIV.size() < 16)
 	{
 		return std::nullopt;
 	}
 
-	auto decryptedData = DataFromBytes((const char*)decryptedBytes, length);
-	return decryptedData;
+	uint8_t iv[16];
+	memcpy(iv, extraDataIV.data(), sizeof(iv));
+
+	std::vector<unsigned char> decryptedBytes(spd.size());
+	size_t length = decryptedBytes.size();
+	if (gsa_aes256_cbc_pkcs7_decrypt(extraDataKey.data(), iv, spd.data(), spd.size(), decryptedBytes.data(), &length) != 0)
+	{
+		return std::nullopt;
+	}
+
+	decryptedBytes.resize(length);
+	return std::make_optional(decryptedBytes);
 }
 
 std::optional<std::vector<unsigned char>> ALTDecryptDataGCM(std::vector<unsigned char>& sk, std::vector<unsigned char>& encryptedData)
 {
-	const struct ccmode_gcm* decrypt_mode = ccaes_gcm_decrypt_mode();
-
-	ccgcm_ctx* gcm_ctx = (ccgcm_ctx*)malloc(decrypt_mode->size);
-	decrypt_mode->init(decrypt_mode, gcm_ctx, sk.size(), sk.data());
-
+	// Layout: [3B "XYZ" version/AAD][16B IV][ciphertext][16B tag]
 	if (encryptedData.size() < 35)
 	{
 		odslog("ERROR: Encrypted token too short.");
 		return std::nullopt;
 	}
 
-	if (cc_cmp_safe(3, encryptedData.data(), "XYZ"))
+	if (gsa_consttime_eq(encryptedData.data(), (const uint8_t*)"XYZ", 3) != 1)
 	{
 		odslog("ERROR: Encrypted token wrong version!");
 		return std::nullopt;
 	}
 
-	decrypt_mode->set_iv(gcm_ctx, 16, encryptedData.data() + 3);
-	decrypt_mode->gmac(gcm_ctx, 3, encryptedData.data());
-
 	size_t decrypted_len = encryptedData.size() - 35;
+	std::vector<unsigned char> decryptedBytes(decrypted_len ? decrypted_len : 1);
 
-	char* decryptedBytes = (char*)malloc(decrypted_len);
+	const uint8_t* aad = encryptedData.data();              // 3 bytes "XYZ"
+	const uint8_t* iv  = encryptedData.data() + 3;          // 16 bytes
+	const uint8_t* ct  = encryptedData.data() + 3 + 16;     // ciphertext
+	const uint8_t* tag = encryptedData.data() + encryptedData.size() - 16;
 
-	decrypt_mode->gcm(gcm_ctx, decrypted_len, encryptedData.data() + 16 + 3, decryptedBytes);
-
-	char tag[16];
-	decrypt_mode->finalize(gcm_ctx, 16, tag);
-
-	if (cc_cmp_safe(16, encryptedData.data() + decrypted_len + 19, tag))
+	if (gsa_aes256_gcm_decrypt(sk.data(), iv, 16, aad, 3, ct, decrypted_len, tag, decryptedBytes.data()) != 0)
 	{
 		odslog("ERROR: Invalid tag version.");
 		return std::nullopt;
 	}
 
-	auto decryptedData = DataFromBytes((const char*)decryptedBytes, decrypted_len);
-	return decryptedData;
+	decryptedBytes.resize(decrypted_len);
+	return std::make_optional(decryptedBytes);
 }
 
 std::vector<unsigned char> ALTCreateAppTokensChecksum(std::vector<unsigned char>& sk, std::string adsid, std::vector<std::string> apps)
 {
-	const struct ccdigest_info* di_info = ccsha256_di();
-	size_t hmac_size = cchmac_di_size(di_info);
-	struct cchmac_ctx* hmac_ctx = (struct cchmac_ctx*)malloc(hmac_size);
-	cchmac_init(di_info, hmac_ctx, sk.size(), sk.data());
-
+	// HMAC-SHA256(sk, "apptokens" || adsid || app-id-0 || app-id-1 || ...)
+	std::vector<unsigned char> message;
 	const char* key = "apptokens";
-	cchmac_update(di_info, hmac_ctx, strlen(key), key);
-
-	const char* adsidUTF8 = adsid.c_str();
-	cchmac_update(di_info, hmac_ctx, strlen(adsidUTF8), adsidUTF8);
-
-	for (auto app : apps)
+	message.insert(message.end(), key, key + strlen(key));
+	message.insert(message.end(), adsid.begin(), adsid.end());
+	for (auto& app : apps)
 	{
-		cchmac_update(di_info, hmac_ctx, app.size(), app.c_str());
+		message.insert(message.end(), app.begin(), app.end());
 	}
 
-	char* checksumBytes = (char*)malloc(di_info->output_size);
-	cchmac_final(di_info, hmac_ctx, (unsigned char *)checksumBytes);
+	uint8_t checksumBytes[GSA_SHA256_LEN];
+	gsa_hmac_sha256(sk.data(), sk.size(), message.data(), message.size(), checksumBytes);
 
-	auto checksum = DataFromBytes(checksumBytes, di_info->output_size);
-	return checksum;
+	return DataFromBytes((const char*)checksumBytes, sizeof(checksumBytes));
 }
 
 pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>> AppleAPI::Authenticate(
@@ -218,11 +164,6 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 	std::shared_ptr<AnisetteData> anisetteData,
 	std::optional<std::function <pplx::task<std::optional<std::string>>(void)>> verificationHandler)
 {
-	if (RNG == nullptr)
-	{
-		RNG = ccrng(NULL);
-	}
-
 	auto adsidValue = std::make_shared<std::string>("");
 	auto sessionValue = std::make_shared<AppleAPISession>();
 
@@ -253,28 +194,32 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 		{ "X-Apple-I-SRL-NO", plist_new_string(anisetteData->deviceSerialNumber().c_str()) }
 	};
 
-	/* Begin CoreCrypto Logic */
-	ccsrp_const_gp_t gp = ccsrp_gp_rfc5054_2048();
+	/* Begin libgsa (corecrypto-free) Logic */
 
-	const struct ccdigest_info* di_info = ccsha256_di();
-	struct ccdigest_ctx* di_ctx = (struct ccdigest_ctx*)malloc(ccdigest_di_size(di_info));
-	ccdigest_init(di_info, di_ctx);
+	// Negotiation-proof running digest buffer. Heap-allocated and intentionally
+	// leaked so it survives across the async .then() continuations that capture
+	// it by value (matching the original malloc'd ccdigest_ctx lifetime).
+	const void* di_info = nullptr;
+	std::vector<unsigned char>* di_ctx = new std::vector<unsigned char>();
 
-	const struct ccdigest_info* srp_di = ccsha256_di();
-	ccsrp_ctx_t srp_ctx = (ccsrp_ctx_t)malloc(ccsrp_sizeof_srp(di_info, gp));
-	ccsrp_ctx_init(srp_ctx, srp_di, gp);
-
-	HDR(srp_ctx)->blinding_rng = ccrng(NULL);
-	HDR(srp_ctx)->flags.noUsernameInX = true;
+	// gsa_srp implements the Apple GrandSlam SRP-6a variant (RFC 5054 2048-bit
+	// group, SHA-256, noUsernameInX) internally — there are no flags to flip.
+	gsa_srp_ctx* srp_ctx = gsa_srp_new();
+	if (srp_ctx == nullptr)
+	{
+		throw APIError(APIErrorCode::AuthenticationHandshakeFailed);
+	}
 
 	std::vector<std::string> ps = { "s2k", "s2k_fo" };
 	ALTDigestUpdateString(di_info, di_ctx, ps[0]);
 	ALTDigestUpdateString(di_info, di_ctx, ",");
 	ALTDigestUpdateString(di_info, di_ctx, ps[1]);
 
-	size_t A_size = ccsrp_exchange_size(srp_ctx);
+	size_t A_size = 0;
+	gsa_srp_start(srp_ctx, NULL, &A_size);
 	char* A_bytes = (char*)malloc(A_size);
-	ccsrp_client_start_authentication(srp_ctx, ccrng(NULL), A_bytes);
+	size_t A_outlen = A_size;
+	gsa_srp_start(srp_ctx, (uint8_t*)A_bytes, &A_outlen);
 
 	auto A_data = DataFromBytes(A_bytes, A_size);
 
@@ -303,7 +248,7 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 	auto task = this->SendAuthenticationRequest(parameters, anisetteData)
 		.then([=](plist_t plist) {
 
-		size_t M_size = ccsrp_get_session_key_length(srp_ctx);
+		size_t M_size = GSA_SHA256_LEN; // M1 is a SHA-256 digest (32 bytes)
 		char* M_bytes = (char*)malloc(M_size);
 
 		auto spNode = plist_dict_get_item(plist, "sp");
@@ -357,8 +302,10 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 			throw APIError(APIErrorCode::AuthenticationHandshakeFailed);
 		}
 
-		int result = ccsrp_client_process_challenge(srp_ctx, appleID.c_str(), passwordKey->size(), passwordKey->data(),
-			salt.size(), salt.data(), B_data.data(), M_bytes);
+		int result = gsa_srp_process(srp_ctx, appleID.c_str(),
+			passwordKey->data(), passwordKey->size(),
+			salt.data(), salt.size(),
+			B_data.data(), B_data.size(), (uint8_t*)M_bytes);
 		if (result != 0)
 		{
 			throw APIError(APIErrorCode::AuthenticationHandshakeFailed);
@@ -419,7 +366,7 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 				uint64_t M2_size = 0;
 				plist_get_data_val(M2_node, &M2_bytes, &M2_size);
 
-				if (!ccsrp_client_verify_session(srp_ctx, (const uint8_t*)M2_bytes))
+				if (gsa_srp_verify(srp_ctx, (const uint8_t*)M2_bytes) != 0)
 				{
 					odslog("ERROR: Failed to verify session.");
 					throw APIError(APIErrorCode::AuthenticationHandshakeFailed);
@@ -468,7 +415,7 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 				auto np = DataFromBytes(npBytes, npSize);
 				ALTDigestUpdateData(di_info, di_ctx, np);
 
-				size_t digest_len = di_info->output_size;
+				size_t digest_len = GSA_SHA256_LEN;
 				if (np.size() != digest_len)
 				{
 					odslog("ERROR: Neg proto hash is too short.");
@@ -476,11 +423,11 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 				}
 
 				unsigned char* digest = (unsigned char*)malloc(digest_len);
-				di_info->final(di_info, di_ctx, digest);
+				gsa_sha256(di_ctx->data(), di_ctx->size(), digest);
 
 				auto hmacKey = ALTCreateSessionKey(srp_ctx, "HMAC key:");
 				unsigned char* hmac_out = (unsigned char*)malloc(digest_len);
-				cchmac(di_info, hmacKey.size(), hmacKey.data(), digest_len, digest, hmac_out);
+				gsa_hmac_sha256(hmacKey.data(), hmacKey.size(), digest, digest_len, hmac_out);
 
 				odslog("HMAC_OUT:");
 				for (int i = 0; i < digest_len; i++)
@@ -502,8 +449,8 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 					odslog("Byte:" << str);
 				}
 
-				/*
-				if (cc_cmp_safe(digest_len, hmac_out, np.data()))
+				/* Negotiation-proof HMAC check (kept disabled, as upstream):
+				if (gsa_consttime_eq(hmac_out, np.data(), digest_len) != 1)
 				{
 					odslog("ERROR: Invalid neg prot hmac.");
 					throw APIError(APIErrorCode::AuthenticationHandshakeFailed);
